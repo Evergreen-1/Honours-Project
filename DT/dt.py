@@ -99,8 +99,8 @@ def wrap_env(
 
     def scale_reward(reward):
         return reward_scale * reward
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
+    #-------------------------------------------------------------------------Changed due to newer gymassium import
+    env = gym.wrappers.TransformObservation(env, normalize_state, env.observation_space)
     if reward_scale != 1.0:
         env = gym.wrappers.TransformReward(env, scale_reward)
     return env
@@ -370,7 +370,9 @@ def eval_rollout(
     time_steps = torch.arange(model.episode_len, dtype=torch.long, device=device)
     time_steps = time_steps.view(1, -1)
 
-    states[:, 0] = torch.as_tensor(env.reset(), device=device)
+    #------------------------------------------------------------------------Changed here for new gymnassium import
+    obs , _ = env.reset(seed=config.eval_seed)
+    states[:, 0] = torch.as_tensor(obs, device=device)
     returns[:, 0] = torch.as_tensor(target_return, device=device)
 
     # cannot step higher than model episode len, as timestep embeddings will crash
@@ -386,7 +388,9 @@ def eval_rollout(
             time_steps[:, : step + 1][:, -model.seq_len :],
         )
         predicted_action = predicted_actions[0, -1].cpu().numpy()
-        next_state, reward, done, info = env.step(predicted_action)
+        #------------------------------------------------------------------------Changed here for new gymnassium import
+        next_state, reward, terminated, truncated, info = env.step(predicted_action)
+        done = terminated or truncated
         # at step t, we predict a_t, get s_{t + 1}, r_{t + 1}
         actions[:, step] = torch.as_tensor(predicted_action)
         states[:, step + 1] = torch.as_tensor(next_state)
@@ -394,7 +398,7 @@ def eval_rollout(
 
         episode_return += reward
         episode_len += 1
-
+        print(f"step={step}, reward={reward}, return={returns[:, step+1]}")
         if done:
             break
 
@@ -496,7 +500,8 @@ def train(config: TrainConfig):
         if step % config.eval_every == 0 or step == config.update_steps - 1:
             model.eval()
             for target_return in config.target_returns:
-                eval_env.seed(config.eval_seed)
+                #-------------------------------------------------------------------------------------Changed here due to newer imports
+                #eval_env.seed(config.eval_seed)
                 eval_returns = []
                 for _ in trange(config.eval_episodes, desc="Evaluation", leave=False):
                     eval_return, eval_len = eval_rollout(

@@ -419,7 +419,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
 
     # Walker2d-medium target return-to-go (D4RL paper value)
     target_return = 3_000.0 * reward_scale
-    eval_freq     = max(update_steps // 10, 10_000)
+    eval_freq     = max(update_steps // 10, 10)
     best_score    = -np.inf
 
     # Normalised eval env
@@ -487,7 +487,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
             norm = get_normalized_score(raw)
             print(f"  [DT]  step {step+1:>7,}  norm_score={norm:.2f}")
             best_score = max(best_score, norm)
-
+        
     return best_score
 
 
