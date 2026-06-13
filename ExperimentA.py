@@ -82,7 +82,7 @@ def get_args():
     parser.add_argument("--algo",      choices=["dt", "cql", "cdt"], default="dt")
     parser.add_argument("--noise",     type=float, default=0.0)
     parser.add_argument("--seed",      type=int,   default=0)
-    parser.add_argument("--device",    type=str,   default="auto")
+    parser.add_argument("--device",    type=str,   default="cpu")
     parser.add_argument("--dataset",   type=str,   default="mujoco/walker2d/medium-v0")
     parser.add_argument("--dt_steps",  type=int,   default=100_000)
     parser.add_argument("--cql_steps", type=int,   default=1_000_000)
@@ -400,8 +400,15 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
                 a = pad_along_axis(a, seq_len)
                 r = pad_along_axis(r, seq_len)
             S.append(s); A.append(a); R.append(r); T.append(t); M.append(mask)
-        f = lambda x: torch.tensor(np.stack(x), dtype=torch.float32, device=device)
-        return f(S), f(A), f(R), torch.tensor(np.stack(T), dtype=torch.long, device=device), f(M)
+        
+        # Convert to tensor directly on target device
+        return (
+            torch.tensor(np.stack(S), dtype=torch.float32, device=device),
+            torch.tensor(np.stack(A), dtype=torch.float32, device=device),
+            torch.tensor(np.stack(R), dtype=torch.float32, device=device),
+            torch.tensor(np.stack(T), dtype=torch.long, device=device),
+            torch.tensor(np.stack(M), dtype=torch.float32, device=device)
+        )
 
     state_dim  = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -417,12 +424,10 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
     optim     = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4, betas=(0.9, 0.999))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lambda s: min((s + 1) / 10_000, 1))
 
-    # Walker2d-medium target return-to-go (D4RL paper value)
     target_return = 3_000.0 * reward_scale
     eval_freq     = max(update_steps // 10, 10)
     best_score    = -np.inf
 
-    # Normalised eval env
     import gymnasium as gym
 
     class NormWrapper(gym.ObservationWrapper):
@@ -431,38 +436,44 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
 
     eval_env = NormWrapper(env)
 
-    def actor_fn(obs, dev):
-        # Stateless single-step wrapper for eval (resets context each call)
-        # Full autoregressive eval uses eval_rollout below
-        return None
-
     def eval_dt(n_episodes=10):
-        """Full autoregressive DT rollout using gymnasium API."""
         model.eval()
         rets = []
         for ep_i in range(n_episodes):
             obs, _ = eval_env.reset(seed=seed + ep_i)
-            states  = torch.zeros(1, 1001, state_dim,  dtype=torch.float32, device=device)
-            actions = torch.zeros(1, 1000, action_dim, dtype=torch.float32, device=device)
-            returns = torch.zeros(1, 1001,              dtype=torch.float32, device=device)
+            
+            # Explicitly force variables to live strictly on the chosen device
+            states    = torch.zeros(1, 1001, state_dim,  dtype=torch.float32, device=device)
+            actions   = torch.zeros(1, 1000, action_dim, dtype=torch.float32, device=device)
+            returns   = torch.zeros(1, 1001,              dtype=torch.float32, device=device)
             timesteps = torch.arange(1000, dtype=torch.long, device=device).unsqueeze(0)
 
-            states[0, 0]  = torch.as_tensor(obs, device=device)
+            states[0, 0]  = torch.as_tensor(obs, dtype=torch.float32, device=device)
             returns[0, 0] = target_return
 
             ep_ret, done = 0.0, False
             for step in range(1000):
+                # Ensure the slicing output retains device registration explicitly
+                s_input = states[:, :step+1][:, -seq_len:].to(device)
+                a_input = actions[:, :step+1][:, -seq_len:].to(device)
+                r_input = returns[:, :step+1][:, -seq_len:].to(device)
+                t_input = timesteps[:, :step+1][:, -seq_len:].to(device)
+
                 pred = model(
-                    states=states[:, :step+1][:, -seq_len:],
-                    actions=actions[:, :step+1][:, -seq_len:],
-                    returns_to_go=returns[:, :step+1][:, -seq_len:],
-                    time_steps=timesteps[:, :step+1][:, -seq_len:],
+                    states=s_input,
+                    actions=a_input,
+                    returns_to_go=r_input,
+                    time_steps=t_input,
                 )
+                
                 act = pred[0, -1].clamp(-max_action, max_action).cpu().detach().numpy()
                 obs, reward, terminated, truncated, _ = eval_env.step(act)
-                actions[0, step] = torch.as_tensor(act, device=device)
-                states[0, step+1]  = torch.as_tensor(obs, device=device)
+                
+                # Write back utilizing exact device targets
+                actions[0, step]   = torch.as_tensor(act, dtype=torch.float32, device=device)
+                states[0, step+1]  = torch.as_tensor(obs, dtype=torch.float32, device=device)
                 returns[0, step+1] = returns[0, step] - reward
+                
                 ep_ret += reward
                 if terminated or truncated:
                     break
@@ -473,14 +484,26 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
     model.train()
     from tqdm import trange
     for step in trange(update_steps, desc="DT Training"):
-    #for step in range(update_steps):
         states, actions, returns, timesteps, mask = sample_batch(64)
-        pred = model(states=states, actions=actions, returns_to_go=returns,
-                     time_steps=timesteps, padding_mask=~mask.to(torch.bool))
+        
+        # Ensure padding mask calculation is directly on-device
+        padding_mask = (~mask.to(torch.bool)).to(device)
+
+        pred = model(
+            states=states, 
+            actions=actions, 
+            returns_to_go=returns,
+            time_steps=timesteps, 
+            padding_mask=padding_mask
+        )
+        
         loss = (F.mse_loss(pred, actions.detach(), reduction="none") * mask.unsqueeze(-1)).mean()
-        optim.zero_grad(); loss.backward()
+        
+        optim.zero_grad()
+        loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 0.25)
-        optim.step(); scheduler.step()
+        optim.step()
+        scheduler.step()
 
         if (step + 1) % eval_freq == 0:
             raw  = eval_dt()
